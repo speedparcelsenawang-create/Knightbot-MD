@@ -5,8 +5,11 @@
 
 'use strict';
 
-const http = require('http');
+const http           = require('http');
+const https          = require('https');
 const { WebSocketServer } = require('ws');
+const { EventEmitter }    = require('events');
+const QRCode         = require('qrcode');
 const fs   = require('fs');
 const path = require('path');
 
@@ -19,8 +22,12 @@ let botSocket    = null;
 let botStatus    = 'offline';
 let connectedAt  = null;
 let messageCount = 0;
-let logs         = [];
-let groupList    = [];
+let logs          = [];
+let groupList     = [];
+let botProfilePic = null;
+let qrDataUrl     = null;
+let needsAuth     = false;
+const dashEv      = new EventEmitter();
 
 const PORT     = process.env.PORT || 3000;
 const MAX_LOGS = 300;
@@ -42,6 +49,26 @@ function getCommandList() {
             .sort();
     } catch { return []; }
 }
+// Fetch a remote image as base64 data URL (follows one redirect)
+function fetchImageAsBase64(url) {
+    return new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? https : http;
+        const req = mod.get(url, res => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+                return fetchImageAsBase64(res.headers.location).then(resolve).catch(reject);
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const ct = res.headers['content-type'] || 'image/jpeg';
+                resolve('data:' + ct + ';base64,' + Buffer.concat(chunks).toString('base64'));
+            });
+            res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+    });
+}
+
 function getStatusSnapshot() {
     const s   = S();
     const mem = process.memoryUsage();
@@ -58,6 +85,9 @@ function getStatusSnapshot() {
         nodeVersion: process.version,
         memoryMB: Math.round(mem.rss / 1024 / 1024),
         groupCount: groupList.length,
+        profilePic: botProfilePic,
+        needsAuth,
+        qrDataUrl,
         settings: {
             botName:     s.botName,
             botOwner:    s.botOwner,
@@ -130,19 +160,26 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 
 /* ── Sidebar ── */
 .sidebar{
-  width:var(--sidebar-w);min-width:var(--sidebar-w);
+  width:var(--sidebar-w);min-width:0;flex-shrink:0;
+  overflow:hidden;transition:width .3s ease;
   background:var(--card);border-right:1px solid var(--border);
-  display:flex;flex-direction:column;height:100vh;overflow-y:auto;
-  position:relative;z-index:50;transition:transform .3s;
+  height:100vh;position:relative;z-index:50;
+}
+.app.sb-closed .sidebar{width:0;border-right-color:transparent}
+.sb-inner{
+  width:var(--sidebar-w);min-width:var(--sidebar-w);
+  height:100%;display:flex;flex-direction:column;overflow-y:auto;
 }
 .sb-brand{
   padding:18px 16px;border-bottom:1px solid var(--border);
   display:flex;align-items:center;gap:10px;flex-shrink:0;
 }
-.sb-icon{
-  width:36px;height:36px;background:var(--green);border-radius:10px;
-  display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0;
+.sb-avatar{
+  width:40px;height:40px;border-radius:50%;overflow:hidden;
+  border:2px solid var(--green);flex-shrink:0;
+  background:#1a2332;display:flex;align-items:center;justify-content:center;font-size:1.15rem;
 }
+.sb-avatar img{width:100%;height:100%;object-fit:cover}
 .sb-name{font-weight:700;font-size:.95rem;color:var(--text);line-height:1.3}
 .sb-ver{font-size:.7rem;color:var(--muted)}
 .sb-nav{padding:10px 8px;flex:1}
@@ -167,7 +204,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 }
 .header-left{display:flex;align-items:center;gap:8px}
 .header-title{font-size:.95rem;font-weight:600;color:var(--text)}
-.menu-btn{display:none;background:none;border:none;color:var(--text);font-size:1.3rem;cursor:pointer;padding:4px;line-height:1}
+.menu-btn{display:flex;align-items:center;background:none;border:none;color:var(--text);font-size:1.3rem;cursor:pointer;padding:4px;line-height:1}
 .status-pill{
   display:flex;align-items:center;gap:6px;
   background:#1c2b22;border:1px solid var(--green);
@@ -321,45 +358,133 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--muted)}
 
+/* ── Ov profile avatar ── */
+.ov-avatar-wrap{display:flex;justify-content:center;margin-bottom:18px}
+.ov-avatar{
+  width:76px;height:76px;border-radius:50%;overflow:hidden;
+  border:3px solid var(--green);background:#1a2332;
+  display:flex;align-items:center;justify-content:center;font-size:2rem;
+}
+.ov-avatar img{width:100%;height:100%;object-fit:cover}
 /* ── Mobile ── */
 .sb-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:45}
 @media(max-width:768px){
-  .sidebar{position:fixed;left:0;top:0;height:100vh;transform:translateX(-100%);z-index:50}
+  .sidebar{
+    position:fixed;left:0;top:0;height:100vh;
+    width:var(--sidebar-w)!important;
+    transform:translateX(-100%);transition:transform .3s;z-index:50;
+  }
+  .app.sb-closed .sidebar{width:var(--sidebar-w)!important}
   .sidebar.open{transform:translateX(0)}
   .sb-overlay.open{display:block}
-  .menu-btn{display:block}
   .info-grid{grid-template-columns:1fr}
   .content{padding:20px 16px 40px}
   .header{padding:0 16px}
 }
 .text-green{color:var(--green)}
 .text-red{color:var(--red)}
+/* ── QR Auth Overlay ── */
+.qr-overlay{
+  display:none;position:fixed;inset:0;z-index:200;
+  background:rgba(13,17,23,.95);backdrop-filter:blur(8px);
+  align-items:center;justify-content:center;flex-direction:column;gap:14px;
+}
+.qr-overlay.active{display:flex}
+.qr-card{
+  background:var(--card);border:2px solid rgba(37,211,102,.35);border-radius:18px;
+  padding:28px 30px;text-align:center;max-width:360px;width:92%;
+  animation:qpulse 2.5s ease-in-out infinite;
+}
+@keyframes qpulse{
+  0%,100%{border-color:rgba(37,211,102,.35);box-shadow:0 0 0 rgba(37,211,102,0)}
+  50%{border-color:rgba(37,211,102,.8);box-shadow:0 0 28px rgba(37,211,102,.15)}
+}
+.qr-head-icon{font-size:2rem;margin-bottom:6px}
+.qr-title{font-size:1.1rem;font-weight:700;color:var(--text);margin-bottom:3px}
+.qr-sub{font-size:.78rem;color:var(--muted);margin-bottom:18px}
+.qr-img-wrap{
+  width:216px;height:216px;margin:0 auto 16px;
+  background:#fff;border-radius:12px;padding:10px;
+  display:flex;align-items:center;justify-content:center;
+}
+.qr-img-wrap img{width:100%;height:100%;object-fit:contain}
+.qr-placeholder{font-size:.77rem;color:#aaa;text-align:center;padding:20px}
+.qr-steps{
+  text-align:left;font-size:.76rem;color:var(--muted);
+  line-height:2;margin-bottom:12px;
+}
+.qr-steps b{color:var(--text)}
+.qr-timer{font-size:.74rem;color:var(--yellow);min-height:1.2em;margin-bottom:12px}
+.qr-actions{display:flex;flex-direction:column;gap:7px}
+.qr-btn{
+  border-radius:8px;padding:9px 14px;font-size:.82rem;
+  cursor:pointer;transition:all .2s;font-weight:600;
+}
+.qr-btn-primary{background:rgba(37,211,102,.12);border:1px solid rgba(37,211,102,.4);color:var(--green)}
+.qr-btn-primary:hover{background:rgba(37,211,102,.24)}
+.qr-btn-danger{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.35);color:var(--red)}
+.qr-btn-danger:hover{background:rgba(248,81,73,.2)}
+.qr-success{
+  display:none;background:rgba(37,211,102,.12);
+  border:1px solid rgba(37,211,102,.3);border-radius:10px;
+  padding:12px 22px;color:var(--green);font-size:.88rem;font-weight:600;
+}
 </style>
 </head>
 <body>
-<div class="app">
+<!-- ── QR Auth Overlay ── -->
+<div class="qr-overlay" id="qrOverlay">
+  <div class="qr-card" id="qrCard">
+    <div class="qr-head-icon">&#128241;</div>
+    <div class="qr-title">Scan QR to Connect</div>
+    <div class="qr-sub">KnightBot MD requires WhatsApp authentication</div>
+    <div class="qr-img-wrap">
+      <img id="qrImg" src="" alt="QR" style="display:none">
+      <div class="qr-placeholder" id="qrPlaceholder">&#9685; Generating QR code&hellip;</div>
+    </div>
+    <div class="qr-steps">
+      <b>1.</b> Open WhatsApp on your phone<br>
+      <b>2.</b> Tap &#8942; &rarr; <em>Linked Devices</em><br>
+      <b>3.</b> Tap <em>Link a Device</em><br>
+      <b>4.</b> Point camera at the QR above
+    </div>
+    <div class="qr-timer" id="qrTimer"></div>
+    <div class="qr-actions">
+      <button class="qr-btn qr-btn-primary" onclick="refreshQR()">&#8635; Get New QR Code</button>
+      <button class="qr-btn qr-btn-danger" onclick="clearSession()">&#128465; Clear Session &amp; Re-authenticate</button>
+    </div>
+  </div>
+  <div class="qr-success" id="qrSuccess">&#10004; Connected! Loading dashboard&hellip;</div>
+</div>
+
+<div class="app" id="app">
 
   <div class="sb-overlay" id="sbOverlay" onclick="closeSb()"></div>
 
   <!-- ── Sidebar ── -->
   <aside class="sidebar" id="sidebar">
-    <div class="sb-brand">
-      <div class="sb-icon">&#129302;</div>
-      <div>
-        <div class="sb-name">KnightBot MD</div>
-        <div class="sb-ver">v<span id="sbVer">–</span></div>
+    <div class="sb-inner">
+      <div class="sb-brand">
+        <div class="sb-avatar" id="sbAvatar">
+          <img id="sbProfilePic" alt="" style="display:none">
+          <span id="sbAvatarFb">&#129302;</span>
+        </div>
+        <div>
+          <div class="sb-name">KnightBot MD</div>
+          <div class="sb-ver">v<span id="sbVer">–</span></div>
+        </div>
       </div>
-    </div>
-    <nav class="sb-nav">
-      <button class="nav-item active" data-page="overview" onclick="goPage(this)"><span class="nav-icon">&#128202;</span>Overview</button>
-      <button class="nav-item" data-page="commands"  onclick="goPage(this)"><span class="nav-icon">&#9000;&#65039;</span>Commands</button>
-      <button class="nav-item" data-page="features"  onclick="goPage(this)"><span class="nav-icon">&#9889;</span>Features</button>
-      <button class="nav-item" data-page="groups"    onclick="goPage(this)"><span class="nav-icon">&#128101;</span>Groups</button>
-      <button class="nav-item" data-page="settings"  onclick="goPage(this)"><span class="nav-icon">&#9881;&#65039;</span>Settings</button>
-      <button class="nav-item" data-page="logs"      onclick="goPage(this)"><span class="nav-icon">&#128203;</span>Live Logs</button>
-    </nav>
-    <div class="sb-footer">
-      Made by <a href="https://github.com/mruniquehacker/Knightbot-MD" target="_blank">MR UNIQUE HACKER</a>
+      <nav class="sb-nav">
+        <button class="nav-item active" data-page="overview" onclick="goPage(this)"><span class="nav-icon">&#128202;</span>Overview</button>
+        <button class="nav-item" data-page="commands"  onclick="goPage(this)"><span class="nav-icon">&#9000;&#65039;</span>Commands</button>
+        <button class="nav-item" data-page="features"  onclick="goPage(this)"><span class="nav-icon">&#9889;</span>Features</button>
+        <button class="nav-item" data-page="groups"    onclick="goPage(this)"><span class="nav-icon">&#128101;</span>Groups</button>
+        <button class="nav-item" data-page="settings"  onclick="goPage(this)"><span class="nav-icon">&#9881;&#65039;</span>Settings</button>
+        <button class="nav-item" data-page="logs"      onclick="goPage(this)"><span class="nav-icon">&#128203;</span>Live Logs</button>
+      </nav>
+      <div class="sb-footer">
+        Made by <a href="https://github.com/mruniquehacker/Knightbot-MD" target="_blank">MR UNIQUE HACKER</a>
+      </div>
     </div>
   </aside>
 
@@ -421,6 +546,12 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
         </div>
 
         <div class="sec-title">Bot Information</div>
+        <div class="ov-avatar-wrap">
+          <div class="ov-avatar" id="ovAvatar">
+            <img id="ovProfilePic" alt="" style="display:none">
+            <span id="ovAvatarFb">&#129302;</span>
+          </div>
+        </div>
         <div class="info-grid">
           <div class="card">
             <div class="info-row"><span class="info-key">Bot Name</span>    <span class="info-val" id="iBotName">–</span></div>
@@ -572,10 +703,15 @@ function goPage(btn) {
   closeSb();
 }
 function toggleSb() {
-  document.getElementById('sidebar').classList.toggle('open');
-  document.getElementById('sbOverlay').classList.toggle('open');
+  if (window.innerWidth <= 768) {
+    document.getElementById('sidebar').classList.toggle('open');
+    document.getElementById('sbOverlay').classList.toggle('open');
+  } else {
+    document.getElementById('app').classList.toggle('sb-closed');
+  }
 }
 function closeSb() {
+  // Only closes the mobile overlay version
   document.getElementById('sidebar').classList.remove('open');
   document.getElementById('sbOverlay').classList.remove('open');
 }
@@ -602,6 +738,25 @@ function fmtDur(ms) {
   if (h>0) return h+'h '+(m%60)+'m '+(s%60)+'s';
   if (m>0) return m+'m '+(s%60)+'s';
   return s+'s';
+}
+
+// ── Profile picture ─────────────────────────────────────────────────────────
+function applyProfilePic(url) {
+  var pairs = [
+    ['sbProfilePic', 'sbAvatarFb'],
+    ['ovProfilePic', 'ovAvatarFb']
+  ];
+  pairs.forEach(function(p) {
+    var img = document.getElementById(p[0]);
+    var fb  = document.getElementById(p[1]);
+    if (url && img) {
+      img.src = url; img.style.display = 'block';
+      if (fb) fb.style.display = 'none';
+    } else {
+      if (img) { img.src = ''; img.style.display = 'none'; }
+      if (fb)  fb.style.display = '';
+    }
+  });
 }
 
 // ── Apply status data ─────────────────────────────────────────────────────────
@@ -634,6 +789,9 @@ function applyStatus(d) {
   set('sGroups',   d.groupCount != null ? d.groupCount : '–');
   set('sMsgs2',    d.messageCount || 0);
   if (d.commands && d.commands.length) { allCmds = d.commands; renderCmds(allCmds); }
+  if ('profilePic' in d) applyProfilePic(d.profilePic);
+  if (d.needsAuth && d.qrDataUrl) { showQR(d.qrDataUrl); }
+  else if (!d.needsAuth && d.online) { hideQR(); }
 }
 
 // ── Features ─────────────────────────────────────────────────────────────────
@@ -727,7 +885,58 @@ function setLvl(lvl, btn) {
   });
 }
 function clearLogs() { document.getElementById('logBox').innerHTML = ''; }
+// ── QR Auth ───────────────────────────────────────────────────────────────
+var _qrTimerIv  = null;
+var _qrExpire   = 0;
 
+function showQR(url) {
+  var img = document.getElementById('qrImg');
+  var ph  = document.getElementById('qrPlaceholder');
+  var ok  = document.getElementById('qrSuccess');
+  if (img) { img.src = url || ''; img.style.display = url ? 'block' : 'none'; }
+  if (ph)  ph.style.display = url ? 'none' : '';
+  if (ok)  ok.style.display = 'none';
+  document.getElementById('qrOverlay').classList.add('active');
+  _qrExpire = Date.now() + 30000;
+  if (_qrTimerIv) clearInterval(_qrTimerIv);
+  _qrTimerIv = setInterval(function() {
+    var rem = Math.max(0, Math.ceil((_qrExpire - Date.now()) / 1000));
+    var el  = document.getElementById('qrTimer');
+    if (el) el.textContent = rem > 0 ? 'Expires in ' + rem + 's' : 'QR expired — request a new one';
+    if (rem <= 0 && _qrTimerIv) { clearInterval(_qrTimerIv); _qrTimerIv = null; }
+  }, 1000);
+}
+
+function hideQR() {
+  var ok = document.getElementById('qrSuccess');
+  if (ok) { ok.style.display = 'block'; }
+  if (_qrTimerIv) { clearInterval(_qrTimerIv); _qrTimerIv = null; }
+  setTimeout(function() {
+    document.getElementById('qrOverlay').classList.remove('active');
+    if (ok) ok.style.display = 'none';
+  }, 1800);
+}
+
+async function refreshQR() {
+  var timer = document.getElementById('qrTimer');
+  if (timer) timer.textContent = 'Requesting new QR…';
+  try { await fetch('/api/refresh-qr', { method: 'POST' }); }
+  catch(e) { addLog('QR refresh error: ' + e.message, 'err'); }
+}
+
+async function clearSession() {
+  if (!confirm('Delete current session and generate a fresh QR code?\nThe bot will restart.')) return;
+  var timer = document.getElementById('qrTimer');
+  if (timer) timer.textContent = 'Clearing session… please wait';
+  try {
+    await fetch('/api/clear-session', { method: 'POST' });
+    var img = document.getElementById('qrImg');
+    if (img) { img.src = ''; img.style.display = 'none'; }
+    var ph = document.getElementById('qrPlaceholder');
+    if (ph) ph.style.display = '';
+    if (timer) timer.textContent = 'Session cleared. Waiting for new QR…';
+  } catch(e) { addLog('Clear session error: ' + e.message, 'err'); }
+}
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 function connect() {
   var proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -750,6 +959,9 @@ function connect() {
         ['stMsgs','sMsgs2'].forEach(function(id){ var el = document.getElementById(id); if(el) el.textContent = msg.count || 0; });
       }
       else if (msg.type === 'groups') { renderGroups(msg.data || []); }
+      else if (msg.type === 'profile_pic') { applyProfilePic(msg.url); }
+      else if (msg.type === 'qr') { showQR(msg.url); }
+      else if (msg.type === 'qr_clear') { hideQR(); }
     } catch(_) {}
   };
   ws.onclose = function() { setOnline(false); addLog('Disconnected. Reconnecting in 3s…','warn'); setTimeout(connect, 3000); };
@@ -790,6 +1002,23 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/features' && req.method === 'GET') return json(getFeatures());
     if (pathname === '/api/logs'     && req.method === 'GET') return json(logs.slice(-100));
     if (pathname === '/api/groups'   && req.method === 'GET') return json(groupList);
+    if (pathname === '/api/qr'       && req.method === 'GET') return json({ url: qrDataUrl, needsAuth });
+
+    if (pathname === '/api/clear-session' && req.method === 'POST') {
+        try { fs.rmSync(path.join(__dirname, 'session'), { recursive: true, force: true }); } catch {}
+        qrDataUrl = null;
+        needsAuth = true;
+        broadcast({ type: 'qr', url: null });  // clear QR image while waiting
+        addLog('Session cleared via dashboard — restarting bot…', 'warn');
+        dashEv.emit('restart');
+        return json({ success: true });
+    }
+
+    if (pathname === '/api/refresh-qr' && req.method === 'POST') {
+        addLog('QR refresh requested via dashboard', 'info');
+        dashEv.emit('restart');
+        return json({ success: true });
+    }
 
     if (pathname === '/api/features' && req.method === 'POST') {
         const body    = await parseBody(req);
@@ -821,6 +1050,8 @@ wss.on('connection', ws => {
         ws.send(JSON.stringify({ type: 'event', text: log.text, level: log.level, time: log.time }));
     if (groupList.length)
         ws.send(JSON.stringify({ type: 'groups', data: groupList }));
+    if (qrDataUrl)
+        ws.send(JSON.stringify({ type: 'qr', url: qrDataUrl }));
     ws.on('close', () => clients.delete(ws));
     ws.on('error', () => clients.delete(ws));
 });
@@ -838,6 +1069,12 @@ setInterval(() => {
 // ─── Auto-start ───────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
     console.log(`\u{1F310} Web Dashboard: http://localhost:${PORT}`);
+}).on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+        console.warn(`\u26A0\uFE0F  Dashboard: port ${PORT} already in use — dashboard disabled.`);
+    } else {
+        console.error('Dashboard server error:', err.message);
+    }
 });
 
 // ─── Public API (used by index.js) ────────────────────────────────────────────
@@ -863,16 +1100,48 @@ module.exports = {
             })
             .catch(() => {});
 
+        // Fetch bot's own WhatsApp profile picture
+        Promise.resolve()
+            .then(async () => {
+                const jid = sock.user?.id;
+                if (!jid) return;
+                const picUrl = await sock.profilePictureUrl(jid, 'image').catch(() => null);
+                if (!picUrl) return;
+                const b64 = await fetchImageAsBase64(picUrl);
+                botProfilePic = b64;
+                broadcast({ type: 'profile_pic', url: b64 });
+            })
+            .catch(() => {});
+
         broadcast({ type: 'status', data: getStatusSnapshot() });
         addLog('Bot connected to WhatsApp \u2705', 'success');
     },
 
     setBotOffline() {
-        botStatus   = 'offline';
-        connectedAt = null;
+        botStatus     = 'offline';
+        connectedAt   = null;
+        botProfilePic = null;
         broadcast({ type: 'status', data: getStatusSnapshot() });
         addLog('Bot disconnected \u274C', 'err');
     },
+
+    async setQRCode(qrStr) {
+        try {
+            qrDataUrl = await QRCode.toDataURL(qrStr, { scale: 8, margin: 2, errorCorrectionLevel: 'M' });
+            needsAuth = true;
+            broadcast({ type: 'qr', url: qrDataUrl });
+        } catch (e) {
+            console.error('QR generation error:', e.message);
+        }
+    },
+
+    clearQRCode() {
+        qrDataUrl = null;
+        needsAuth = false;
+        broadcast({ type: 'qr_clear' });
+    },
+
+    events: dashEv,
 
     logEvent(text, level = 'info') {
         addLog(text, level);

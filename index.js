@@ -11,6 +11,24 @@
  */
 require('./settings')
 const webDashboard = require('./web')
+
+// Track current socket so we can close it on dashboard-triggered restart
+let _currentSock = null;
+
+// Listen for dashboard restart requests (QR refresh / session clear)
+webDashboard.events.on('restart', async () => {
+    console.log('\uD83D\uDD04 Dashboard requested restart — restarting bot connection…');
+    if (_currentSock) {
+        try {
+            _currentSock.ev.removeAllListeners();
+            if (typeof _currentSock.end === 'function') _currentSock.end();
+        } catch {}
+        _currentSock = null;
+    }
+    await new Promise(r => setTimeout(r, 1500));
+    startXeonBotInc().catch(e => console.error('Restart error:', e.message));
+});
+
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 const chalk = require('chalk')
@@ -74,6 +92,10 @@ setInterval(() => {
 let phoneNumber = "911234567890"
 let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
 
+// Reconnect backoff state
+let _reconnectAttempts = 0;
+const _reconnectDelays = [5, 10, 20, 40, 60, 120]; // seconds per attempt (capped at last)
+
 global.botname = "KNIGHT BOT"
 global.themeemoji = "•"
 const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
@@ -97,6 +119,7 @@ async function startXeonBotInc() {
         const { state, saveCreds } = await useMultiFileAuthState(`./session`)
         const msgRetryCounterCache = new NodeCache()
 
+        _currentSock = null;  // will be set after socket creation
         const XeonBotInc = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
@@ -119,6 +142,7 @@ async function startXeonBotInc() {
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
         })
+        _currentSock = XeonBotInc;  // track for dashboard-triggered restarts
 
         // Save credentials when they update
         XeonBotInc.ev.on('creds.update', saveCreds)
@@ -251,7 +275,8 @@ async function startXeonBotInc() {
         const { connection, lastDisconnect, qr } = s
         
         if (qr) {
-            console.log(chalk.yellow('📱 QR Code generated. Please scan with WhatsApp.'))
+            console.log(chalk.yellow('\uD83D\uDCF1 QR Code generated. Please scan with WhatsApp.'))
+            webDashboard.setQRCode(qr).catch(() => {})
         }
         
         if (connection === 'connecting') {
@@ -259,6 +284,8 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
+            _reconnectAttempts = 0;  // reset backoff on successful connect
+            webDashboard.clearQRCode()
             webDashboard.setBotOnline(XeonBotInc)
             console.log(chalk.magenta(` `))
             console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
@@ -310,8 +337,10 @@ async function startXeonBotInc() {
             
             webDashboard.setBotOffline()
             if (shouldReconnect) {
-                console.log(chalk.yellow('Reconnecting...'))
-                await delay(5000)
+                _reconnectAttempts++;
+                const delaySec = _reconnectDelays[Math.min(_reconnectAttempts - 1, _reconnectDelays.length - 1)];
+                console.log(chalk.yellow(`Reconnecting in ${delaySec}s... (attempt #${_reconnectAttempts})`))
+                await delay(delaySec * 1000)
                 startXeonBotInc()
             }
         }
