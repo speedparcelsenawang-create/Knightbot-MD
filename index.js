@@ -10,6 +10,7 @@
  * - Pair Code implementation inspired by TechGod143 & DGXEON
  */
 require('./settings')
+const webDashboard = require('./web')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 const chalk = require('chalk')
@@ -258,6 +259,7 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
+            webDashboard.setBotOnline(XeonBotInc)
             console.log(chalk.magenta(` `))
             console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
 
@@ -306,6 +308,7 @@ async function startXeonBotInc() {
                 console.log(chalk.red('Session logged out. Please re-authenticate.'))
             }
             
+            webDashboard.setBotOffline()
             if (shouldReconnect) {
                 console.log(chalk.yellow('Reconnecting...'))
                 await delay(5000)
